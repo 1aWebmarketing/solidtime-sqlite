@@ -150,12 +150,20 @@ class DashboardService
 
         $possibleDays = $this->lastDays($days, $timezone);
 
+//        $query = TimeEntry::query()
+//            ->select(DB::raw('DATE('.$dateWithTimeZone.') as date, round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
+//            ->where('user_id', '=', $user->getKey())
+//            ->where('organization_id', '=', $organization->getKey())
+//            ->groupBy(DB::raw('DATE('.$dateWithTimeZone.')'))
+//            ->orderBy('date');
+
         $query = TimeEntry::query()
-            ->select(DB::raw('DATE('.$dateWithTimeZone.') as date, round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
-            ->where('user_id', '=', $user->getKey())
-            ->where('organization_id', '=', $organization->getKey())
-            ->groupBy(DB::raw('DATE('.$dateWithTimeZone.')'))
+            ->select(DB::raw("DATE(datetime(start, '+3600 seconds')) as date, ROUND(SUM(strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))) as aggregate"))
+            ->where('user_id', $user->getKey())
+            ->where('organization_id', $organization->getKey())
+            ->groupBy(DB::raw("DATE(datetime(start, '+3600 seconds'))"))
             ->orderBy('date');
+
 
         $query = $this->constrainDateByPossibleDates($query, $possibleDays, $timezone);
         $resultDb = $query->get()
@@ -192,10 +200,13 @@ class DashboardService
         $possibleDays = $this->daysOfThisWeek($timezone, $user->week_start);
 
         $query = TimeEntry::query()
-            ->select(DB::raw('DATE('.$dateWithTimeZone.') as date, round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
+            ->select(DB::raw("
+                DATE(datetime(start, '+3600 seconds')) AS date,
+                ROUND(SUM(strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))) AS aggregate
+            "))
             ->where('user_id', '=', $user->getKey())
             ->where('organization_id', '=', $organization->getKey())
-            ->groupBy(DB::raw('DATE('.$dateWithTimeZone.')'))
+            ->groupBy(DB::raw("DATE(datetime(start, '+3600 seconds'))"))
             ->orderBy('date');
 
         $query = $this->constrainDateByPossibleDates($query, $possibleDays, $timezone);
@@ -220,7 +231,9 @@ class DashboardService
         $possibleDays = $this->daysOfThisWeek($timezone, $user->week_start);
 
         $query = TimeEntry::query()
-            ->select(DB::raw('round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
+            ->select(DB::raw("
+                ROUND(SUM(strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))) AS aggregate
+            "))
             ->where('user_id', '=', $user->getKey())
             ->where('organization_id', '=', $organization->getKey());
 
@@ -237,7 +250,9 @@ class DashboardService
         $possibleDays = $this->daysOfThisWeek($timezone, $user->week_start);
 
         $query = TimeEntry::query()
-            ->select(DB::raw('round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
+            ->select(DB::raw("
+                ROUND(SUM(strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))) AS aggregate
+            "))
             ->where('billable', '=', true)
             ->where('user_id', '=', $user->getKey())
             ->where('organization_id', '=', $organization->getKey());
@@ -258,12 +273,14 @@ class DashboardService
         $possibleDays = $this->daysOfThisWeek($timezone, $user->week_start);
 
         $query = TimeEntry::query()
-            ->select(DB::raw('
-               round(
-                    sum(
-                        extract(epoch from (coalesce("end", now()) - start)) * (billable_rate::float/60/60)
+            ->select(DB::raw("
+                ROUND(
+                    SUM(
+                        (strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))
+                        * (CAST(billable_rate AS REAL) / 3600)
                     )
-               ) as aggregate'))
+                ) AS aggregate
+            "))
             ->where('billable', '=', true)
             ->whereNotNull('billable_rate')
             ->where('user_id', '=', $user->id);
@@ -286,7 +303,10 @@ class DashboardService
         $timezone = $this->timezoneService->getTimezoneFromUser($user);
 
         $query = TimeEntry::query()
-            ->select(DB::raw('project_id, round(sum(extract(epoch from (coalesce("end", now()) - start)))) as aggregate'))
+            ->select(DB::raw("
+                project_id,
+                ROUND(SUM(strftime('%s', COALESCE(\"end\", CURRENT_TIMESTAMP)) - strftime('%s', start))) AS aggregate
+            "))
             ->where('user_id', '=', $user->getKey())
             ->where('organization_id', '=', $organization->getKey())
             ->groupBy('project_id');
@@ -344,19 +364,23 @@ class DashboardService
     public function latestTeamActivity(Organization $organization): array
     {
         $timeEntries = TimeEntry::query()
-            ->select(DB::raw('distinct on (member_id) member_id, description, id, task_id, start, "end"'))
+            ->select('member_id', 'description', 'id', 'task_id', 'start', 'end')
             ->whereBelongsTo($organization, 'organization')
             ->orderBy('member_id')
             ->orderBy('start', 'desc')
-            // Note: limit here does not work because of the distinct on
             ->with([
                 'member' => [
                     'user',
                 ],
             ])
             ->get()
-            ->sortByDesc('start')
-            ->slice(0, 4);
+            ->groupBy('member_id') // Group by member_id to later get the latest per member
+            ->map(function ($group) {
+                return $group->sortByDesc('start')->first(); // Get the most recent time entry for each member
+            })
+            ->values() // Reset the array keys
+            ->slice(0, 4); // Limit the results to 4
+
 
         $response = [];
 
@@ -423,25 +447,51 @@ class DashboardService
     {
         $timezone = $this->timezoneService->getTimezoneFromUser($user);
         $lastDaysSplitInWindows = $this->lastDaysSplitInWindows(7, $timezone, 8);
-        $data = collect(DB::select('
-            SELECT time_ranges.start, EXTRACT(epoch FROM sum(LEAST(time_ranges."end", coalesce(time_entries."end", :now::timestamp)) - GREATEST(time_ranges.start, time_entries.start))) AS aggregate
-            FROM  (
-               SELECT time_range_starts.start AS start, time_range_starts.start + interval \'3 hours\' AS "end"
-               FROM generate_series(:start_time_ranges::timestamp, :end_time_ranges::timestamp + interval \'3 hours\', interval \'3 hours\') as time_range_starts (start)
-            ) time_ranges
-            JOIN   time_entries ON time_entries.start < time_ranges."end"
-                      AND coalesce(time_entries."end", :now::timestamp) > time_ranges.start
-            WHERE time_entries.user_id = :user_id and
-                  time_entries.organization_id = :organization_id
-            GROUP BY time_ranges.start
-            ORDER BY time_ranges.start
-        ', [
+        $data = collect(DB::select("
+    WITH RECURSIVE time_ranges(start, \"end\") AS (
+        SELECT
+            :start_time_ranges AS start,
+            datetime(:start_time_ranges, '+3 hours') AS \"end\"
+        UNION ALL
+        SELECT
+            datetime(start, '+3 hours'),
+            datetime(\"end\", '+3 hours')
+        FROM time_ranges
+        WHERE start < :end_time_ranges
+    )
+    SELECT
+        time_ranges.start,
+        ROUND(SUM(
+            (strftime('%s',
+                CASE
+                    WHEN time_entries.\"end\" IS NULL OR time_entries.\"end\" > time_ranges.\"end\"
+                    THEN time_ranges.\"end\"
+                    ELSE time_entries.\"end\"
+                END
+            ) - strftime('%s',
+                CASE
+                    WHEN time_entries.start < time_ranges.start
+                    THEN time_ranges.start
+                    ELSE time_entries.start
+                END
+            )
+        ))) AS aggregate
+    FROM time_ranges
+    JOIN time_entries
+        ON time_entries.start < time_ranges.\"end\"
+        AND COALESCE(time_entries.\"end\", :now) > time_ranges.start
+    WHERE time_entries.user_id = :user_id
+        AND time_entries.organization_id = :organization_id
+    GROUP BY time_ranges.start
+    ORDER BY time_ranges.start
+", [
             'start_time_ranges' => $lastDaysSplitInWindows['start'],
             'end_time_ranges' => $lastDaysSplitInWindows['end'],
             'user_id' => $user->getKey(),
             'organization_id' => $organization->getKey(),
             'now' => Carbon::now()->toDateTimeString(),
         ]))->pluck('aggregate', 'start');
+
 
         $response = [];
 
